@@ -5,7 +5,7 @@ use ExtUtils::MakeMaker;
 WriteMakefile(
     NAME                => 'AnyEvent::MultiDownload',
     AUTHOR              => '扶凯 <iakuf@163.com>',
-    EXE_FILES           => [],
+    EXE_FILES           => ['bin/md-request'],
     PL_FILES            => {},
     LICENSE             => "perl",
     DISTNAME            => 'AnyEvent-MultiDownload',

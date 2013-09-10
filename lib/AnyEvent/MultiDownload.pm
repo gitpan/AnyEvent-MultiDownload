@@ -12,7 +12,7 @@ use File::Copy;
 use File::Basename;
 use List::Util qw/shuffle/;
 
-our $VERSION = '0.20';
+our $VERSION = '0.30';
 
 has content_file => (
     is => 'ro',
@@ -318,7 +318,7 @@ __END__
 
 =head1 NAME
 
-AnyEvent::MultiDownloadu - 非阻塞的多线程多地址文件下载的模块
+AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 
 =head1 SYNOPSIS
 
