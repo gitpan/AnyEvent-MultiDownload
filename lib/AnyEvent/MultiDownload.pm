@@ -4,16 +4,17 @@ use strict;
 use AnyEvent::HTTP;
 use AnyEvent::Util;
 use AnyEvent::Socket;
+use AnyEvent::IO;
 use AE;
 use Moo;
-use File::Slurp;
+use File::Temp;
+use File::Copy;
+use File::Basename;
 use List::Util qw/shuffle/;
 
-our $VERSION = '0.10';
+our $VERSION = '0.20';
 
-my %all;
-
-has dlname => (
+has content_file => (
     is => 'ro',
     isa => sub {
         die "文件存在" if -e $_[0];
@@ -33,6 +34,7 @@ has mirror => (
         return 1 if ref $_[0] eq 'ARRAY';
     },
 );
+
 
 has on_finish => (
     is => 'rw',
@@ -60,58 +62,53 @@ has on_seg_finish => (
     },
 );
 
-has seg_size => is => 'rw', default => sub { 2 * 1024 * 1024 };
-has timeout  => is => 'rw', default => sub { 60 };
-has recurse  => is => 'rw', default => sub { 6 }; 
-has signal   => is => 'rw';
+has fh       => (
+    is      => 'rw',
+    lazy    => 1,
+    default => sub {
+        my $out = File::Temp->new(UNLINK => 1); 
+        $out->autoflush(1);
+        return $out;
+    },
+);
 
-sub BUILD {
-    my $self = shift;
-    my $dlname = $self->dlname;
-    $all{$dlname} = 1,
-    my $s = AE::signal INT =>  sub {
-        for my $file (keys %all) {
-            while( glob("$file.*")) {
-                unlink $_;
-            }
-            delete $all{$file};
-        }
-        exit;
-    };
-    $self->signal($s);
-};
+has retry_interval => is => 'rw', default => sub { 3 };
+has max_retries => is => 'rw', default => sub { 5 };
+has seg_size    => is => 'rw', default => sub { 2 * 1024 * 1024 };
+has timeout     => is => 'rw', default => sub { 60 };
+has recurse     => is => 'rw', default => sub { 6 }; 
+has tasks       => is => 'rw', default => sub { [] };
+
 
 sub get_file_length {
     my $self = shift;
     my $cb   = shift;
-
     
     my ($len, $hdr);
     my $cv = AE::cv {
-        $cb->($len, $hdr)
+        $len ? $cb->($len, $hdr) : $self->on_error->("取长度失败");
     };
 
-    my $url = $self->url;
     my $fetch_len; $fetch_len = sub {
         my $retry = shift || 0;
-        my $ev; $ev = http_head $url,
+        my $ev; $ev = http_head $self->url,
             timeout => $self->timeout,
             recurse => $self->recurse,
             sub {
                 (undef, $hdr) = @_;
                 undef $ev;
-                if ($retry < 3) {
-                    $fetch_len->(++$retry); 
+                if ($retry > $self->max_retries) {
+                    $self->on_error->("取长度失败");
                     return;
                 }
                 if ($hdr->{Status} =~ /^2/) {
                     $len = $hdr->{'content-length'};
                 }
-                elsif ($hdr->{Status} =~ /^404/) {
-                    $self->on_error->("$url 文件不存在");
-                }
                 else {
-                    $self->on_error->("取 $url 长度失败");
+                    my $w;$w = AE::timer( $self->retry_interval, 0, sub {
+                        $fetch_len->(++$retry); 
+                        undef $w;
+                    });
                 }
                 $cv->end;
             };
@@ -128,42 +125,24 @@ sub multi_get_file  {
 
         my $ranges = $self->split_range($len);
 
+        # 用于做事件同步
         my $cv = AE::cv { 
             my $cv = shift;
-            $self->on_join($ranges, $self->dlname);
+            $self->move_to;
+            $self->on_finish->($self->size);
         };
 
         # 事件开始, 但这个回调会在最后才调用.
         $cv->begin;
         for my $range (@$ranges) {
             $cv->begin;
-            my $uri = $self->shuffle_url;
-            $self->fetch->( $cv, $uri, $range, 0 ) ;
+            $self->fetch->( $cv, $self->shuffle_url, $range, 0 ) ;
         }
         $cv->end;
     });
 }
 
-sub on_join {
-    my ($self, $ranges) = @_;
-    my $dlname = $self->dlname;
 
-    AnyEvent::Util::fork_call {
-        local $/;
-        open my $wfh, '>:raw', $dlname or die "$dlname:$!";
-        for my $range ( @$ranges ) {
-            my $tmpf = $dlname . '.' . $range->{chunk};
-            open my $rfh, '<:raw', $tmpf or die "$tmpf:$!";
-            my $content = <$rfh>;
-            print $wfh $content;
-            close $rfh;
-            unlink $tmpf;
-        }
-        return -s $dlname
-    } sub {
-        $self->on_finish->($_[0]);
-    }
-}
 sub shuffle_url {
     my $self = shift;
     my @urls;
@@ -172,6 +151,23 @@ sub shuffle_url {
     return (shuffle @urls)[0];
 }
 
+sub on_body {
+    my ($self, $chunk) = @_; 
+    return sub {
+        my ($partial_body, $hdr) = @_;
+        return 0 unless ($hdr->{Status} == 206 || $hdr->{Status} == 200);
+        my $task_chunk = $self->tasks->[$chunk];
+
+        seek($self->fh, $task_chunk->{pos}, 0); 
+        syswrite($self->fh, $partial_body);
+
+        # 写完的记录
+        my $len = length($partial_body);
+        $task_chunk->{pos}   += $len;
+        $task_chunk->{size}  += $len;
+        return 1;
+    }
+}
 sub fetch {
     my $self = shift;
     return sub {
@@ -179,78 +175,59 @@ sub fetch {
         $retry ||= 0;
         my $ofs  = $range->{ofs};
         my $tail = $range->{tail};
-        my $tmpf = $self->dlname. '.' .$range->{chunk};
-        unlink $tmpf;
+        my $chunk = $range->{chunk};
 
         my $buf;
         my $ev; $ev = http_get $url,
-            timeout => $self->timeout,
-            recurse => $self->recurse,
+            timeout     => $self->timeout,
+            recurse     => $self->recurse,
             persistent  => 1,
             keepalive   => 1,
-            headers => { 
+            headers     => { 
                 Range => "bytes=$ofs-$tail" 
             },
-            on_body => sub {
-                my ($partial_body, $hdr) = @_;
-                my $status = $hdr->{Status};
-                if ( $status == 200 || $status == 206 || $status == 416 ) {
-                    $buf += length($partial_body) if $range->{chunk} == 1;
-                    write_file( $tmpf, {append => 1}, $partial_body ); # 追加写文件
-                }
-                return 1;
-            },
+            on_body => $self->on_body($chunk),
             sub {
                 my ($hdl, $hdr) = @_;
 
                 my $status = $hdr->{Status};
 
-                if ( $retry > 3 ) {
-                    $cv->on_error->("地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载失败 $retry");
-                    $cv->end;
+                $cv->end;
+                undef $ev;
+
+                if ( $retry > $self->max_retries ) {
+                    $self->on_error->("地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载失败");
                 }
 
                 if ($status == 200 || $status == 206 || $status == 416) {
-                    my $size = -s $tmpf;
-                    if ( $size == ($tail-$ofs+1) ) {
-                        $self->on_seg_finish->($hdl, $tmpf, $size, sub {
+                    my $size = $self->tasks->[$chunk]{size};
+                    if ($size == ($tail-$ofs+1)) {
+                        $self->on_seg_finish->( $hdl, $self->get_chunk($ofs, $self->seg_size), $size, $chunk, sub {
                             my $result = shift;
                             if (!$result) {
-                                AE::log debug => "地址 $url 的块 $range->{chunk} 检查失败, 范围 bytes=$ofs-$tail 重试";
-                                $self->fetch->($cv, $self->shuffle_url, $range, ++$retry ) 
+                                $self->retry($cv, $range, $retry);
+                                return;
                             }
-                            else {
-                                AE::log debug => "地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载完成";
-                                $cv->end;
-                            }
+                            AE::log debug => "地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载完成";
                         });
+                        return;
                     }
-                    else {
-                        AE::log warn => "地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载失败, 第 $retry 次重试";
-                        $self->fetch->($cv, $self->shuffle_url, $range, ++$retry ) 
-                    }
-                } elsif ($status == 412 or $status == 500 or $status == 503 or $status =~ /^59/) {
-                        AE::log warn => "地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载失败, 第 $retry 次重试";
-                        $self->fetch->($cv, $self->shuffle_url, $range, ++$retry ) 
                 } 
-                else {
-                    $cv->end;
-
-                }
-                undef $ev;
+                $self->retry($cv, $range, $retry);
             };
     };
 }
 
-sub clean {
-    my $self = shift;
-    return sub {
-        for my $range ( @{ $self->ranges } ) {
-            my $dlname = $self->dlname . '.' . $range->{chunk};
-            unlink $dlname;
-        }
-        exit;
-    };
+sub retry {
+    my ($self, $cv, $range, $retry) = @_;
+    my $chunk = $range->{chunk};
+    my $w;$w = AE::timer( $self->retry_interval, 0, sub {
+        AE::log warn => "地址块 $range->{chunk} 范围 bytes=$range->{ofs}  $range->{tail} 下载失败, 第 $retry 次重试";
+        $cv->begin;
+        $self->tasks->[$chunk]->{pos} = $self->tasks->[$chunk]->{ofs}; # 重下本块时要 seek 回零
+        $self->fetch->( $cv, $self->shuffle_url, $range, ++$retry );
+        undef $w;
+    });
 }
 
 sub split_range {
@@ -282,16 +259,53 @@ sub split_range {
         }
 
         my $Range = "bytes=$ofs-" . $tail ;
+        my $task  = { 
+            ofs   => $ofs,
+            tail  => $tail,
+            chunk => $chunk,
+            pos   => $ofs,
+            size  => 0,
+        }; 
 
-        push( @ranges, {
-                 ofs   => $ofs,
-                 tail  => $tail,
-                 chunk => $chunk,
-                } 
-        );
+        $self->tasks->[$chunk] = $task; 
+        push @ranges, $task;
         $chunk++;
     }
     return \@ranges;
+}
+
+sub get_chunk {
+  my ($self, $offset, $max) = @_; 
+  $max ||= 1024 * 1024;
+
+  my $handle = $self->fh;
+  $handle->sysseek($offset, SEEK_SET);
+
+  my $buffer;
+  $handle->sysread($buffer, $max); 
+
+  return $buffer;
+}
+
+sub move_to {
+    my $self = shift;
+
+    close $self->fh;
+    my $dir  = File::Basename::dirname( $self->content_file );
+    if (! -e $dir ) {
+        if (! File::Path::make_path( $dir ) || ! -d $dir ) {
+            my $e = $!;
+        }
+    }
+    File::Copy::copy( $self->fh->filename, $self->content_file )
+          or die "Failed to rename $self->fh->filename to $self->content_file: $!";
+
+    delete $self->{fh};
+}
+
+sub size {
+  return 0 unless defined(my $file = shift->content_file);
+  return -s $file;
 }
 
 1;
@@ -308,21 +322,26 @@ AnyEvent::MultiDownloadu - 非阻塞的多线程多地址文件下载的模块
 
 =head1 SYNOPSIS
 
-这是一个全非阻塞的多线程多地址文件下载的模块, 可以象下面这个应用一样,同时下载多个文件,并且整个过程都是异步事件解发,不会阻塞主进程.
+这是一个全非阻塞的多线程多地址文件下载的模块, 可以象下面这个应用一样, 同时下载多个文件, 并且整个过程都是异步事件解发, 不会阻塞主进程.
 
-下面是个简单的例子,同时从多个地址下载同一个文件.
+下面是个简单的例子, 同时从多个地址下载同一个文件.
 
     use AE;
     use AnyEvent::MultiDownload;
+
+    my @urls = (
+        'http://mirrors.163.com/ubuntu-releases/12.04/ubuntu-12.04.2-desktop-i386.iso',
+        'http://releases.ubuntu.com/12.04.2/ubuntu-12.04.2-desktop-i386.iso',
+    );
     
     my $cv = AE::cv;
     my $MultiDown = AnyEvent::MultiDownload->new( 
-        url     => 'http://mirrors.163.com/ubuntu-releases/12.04/ubuntu-12.04.2-desktop-i386.iso', 
-        mirror  => ['http://mirrors.163.com/ubuntu-releases/12.04/ubuntu-12.04.2-desktop-i386.iso', 'http://releases.ubuntu.com/12.04.2/ubuntu-12.04.2-desktop-i386.iso'],
-        dlname  => '/tmp/ubuntu.iso',
+        url     => pop @urls, 
+        mirror  => \@urls, 
+        content_file  => '/tmp/ubuntu.iso',
         seg_size => 1 * 1024 * 1024, # 1M
         on_seg_finish => sub {
-            my ($hdr, $seg_path, $size, $cb) = @_;
+            my ($hdr, $seg, $size, $chunk, $cb) = @_;
             $cb->(1);
         },
         on_finish => sub {
@@ -331,7 +350,7 @@ AnyEvent::MultiDownloadu - 非阻塞的多线程多地址文件下载的模块
         },
         on_error => sub {
             my $error = shift;
-            $cv->end;
+            $cv->send;
         }
     )->multi_get_file;
     
@@ -348,11 +367,7 @@ AnyEvent::MultiDownloadu - 非阻塞的多线程多地址文件下载的模块
     $cv->begin;
     my $MultiDown = AnyEvent::MultiDownload->new( 
         url     => 'http://xxx1',
-        dlname  => "/tmp/file2",
-        on_seg_finish => sub {
-            my ($hdr, $seg_path, $size, $cb) = @_;
-            $cb->(1);
-        },
+        content_file  => "/tmp/file2",
         on_finish => sub {
             my $len = shift;
             $cv->end;
@@ -366,7 +381,7 @@ AnyEvent::MultiDownloadu - 非阻塞的多线程多地址文件下载的模块
     
     $cv->begin;
     my $MultiDown1 = AnyEvent::MultiDownload->new( 
-        dlname  => "/tmp/file1",
+        content_file  => "/tmp/file1",
         url     => 'http://xxx', 
         on_finish => sub {
             my $len = shift;
@@ -390,10 +405,10 @@ AnyEvent::MultiDownloadu - 非阻塞的多线程多地址文件下载的模块
     my $MultiDown = AnyEvent::MultiDownload->new( 
             url     => 'http://mirrors.163.com/ubuntu-releases/12.04/ubuntu-12.04.2-desktop-i386.iso', 
             mirror  => ['http://mirrors.163.com/ubuntu-releases/12.04/ubuntu-12.04.2-desktop-i386.iso', 'http://releases.ubuntu.com/12.04.2/ubuntu-12.04.2-desktop-i386.iso'],
-            dlname  => $dlname,
+            content_file  => $content_file,
             seg_size => 1 * 1024 * 1024, # 1M
             on_seg_finish => sub {
-                my ($hdr, $seg_path, $size, $cb) = @_;
+                my ($hdr, $seg_path, $size, $chunk,  $cb) = @_;
                 $cb->(1);
             },
             on_finish => sub {
@@ -407,49 +422,62 @@ AnyEvent::MultiDownloadu - 非阻塞的多线程多地址文件下载的模块
     
     );
 
-=over 9
+=over 11
 
 =item url => 下载的主地址
 
-这个是下载用的 master 的地址, 是主地址,这个参数必须有.
+这个是下载用的 master 的地址, 是主地址, 这个参数必须有.
 
-=item dlname => 下载后的存放地址
+=item content_file => 下载后的存放地址
 
-这个地址用于指定,下载完了,存放在什么位置. 这个参数必须有.
+这个地址用于指定, 下载完了, 存放在什么位置. 这个参数必须有.
 
 =item mirror => 镜象地址
 
-这个是可以用来做备用地址和分块下载时用的地址. 需要一个数组引用,其中放入这个文件的其它用于下载的地址. 本参数不是必须的.
+这个是可以用来做备用地址和分块下载时用的地址. 需要一个数组引用, 其中放入这个文件的其它用于下载的地址. 如果块下载失败会自动切换成其它的地址下载. 本参数不是必须的.
 
 =item seg_size => 下载块的大小
 
-默认这个 seg_size 是指每次取块的大小,默认是 2M 一个块, 这个参数会给文件按照 2M 的大小来切成一个个块来下载并合并.本参数不是必须的.
+默认这个 seg_size 是指每次取块的大小,默认是 1M 一个块, 这个参数会给文件按照 1M 的大小来切成一个个块来下载并合并. 本参数不是必须的.
 
-=item on_seg_finish => 每块的下载完成回调
 
-当每下载完 1M 时,会回调一次, 你可以用于检查你的下载每块的完整性,这个时候只有 200 和 206 响应的时候才会回调,回调传四个参数,本块下载时响应的 header, 下载的块的临时文件位置, 下载块的大家,检查完后的回调.如果回调为 1 证明检查结果正常,如果为 0 证明检查失败,会在次重新下载本块. 默认模块也会帮助检查大小,所以大小不用对比和检查了,可以给每块的 MD5 记录下来,使用这个来对比. 本参数不是必须的.如果没有这个回调默认检查大小正确.
+=item retry_interval => 重试的间隔 
+
+重试的间隔, 默认为 3 s.
+
+=item max_retries => 最多重试的次数
+
+重试每个块所能重试的次数, 默认为 5 次.
+
+=item on_seg_finish => 每块的下载完回调
+
+当每下载完 1M 时,会回调一次, 你可以用于检查你的下载每块的完整性, 这个时候只有 200 和 206 响应的时候才会回调.
+
+回调传四个参数, 本块下载时响应的 header, 下载的块的实体二进制内容, 下载块的大小, 当前是第几块 检查完后的回调. 这时如果回调为 1 证明检查结果正常, 如果为 0 证明检查失败, 会在次重新下载本块. 
+
+默认模块会帮助检查大小, 所以大小不用对比和检查了, 可以给每块的 MD5 记录下来, 使用这个来对比. 本参数不是必须的. 如果没有这个回调默认检查大小正确.
 
 =item on_finish
 
-当整个文件下载完成时的回调, 下载完成的回调会传一个下载的文件大小的参数过来.这个回调必须存在.
+当整个文件下载完成时的回调, 下载完成的回调会传一个下载的文件大小的参数过来. 这个回调必须存在.
 
 =item on_error
 
-当整个文件下载过程出错时回调,这个参数必须存在,因为不能保证每次下载都能正常.
+当整个文件下载过程出错时回调, 这个参数必须存在, 因为不能保证每次下载都能正常.
 
 =item timeout
 
-下载多久算超时,可选参数,默认为 60s.
+下载多久算超时, 可选参数, 默认为 60s.
 
 =item recurse 重定向
 
-如果请求过程中有重定向,可以最多重定向多少次.
+如果请求过程中有重定向, 可以最多重定向多少次.
 
 =back
 
-=head2 ->multi_get_file()
+=head2 multi_get_file()
 
-事件开始的方法.只有调用这个函数时,这个下载的事件才开始执行.
+事件开始的方法. 只有调用这个函数时, 这个下载的事件才开始执行.
 
 =head1 AUTHOR
 

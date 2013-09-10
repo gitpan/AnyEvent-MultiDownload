@@ -17,9 +17,17 @@ WriteMakefile(
         'AnyEvent::HTTP'    => 0,
         'AnyEvent::Util'    => 0,
         'AnyEvent::Socket'  => 0,
-        'File::Slurp'   => 0,
-        'List::Util'    => 0,
+        'List::Util'        => 0,
+        'Moo'               => 0,
+        'File::Temp' => 0,
+        'File::Copy' => 0,
+        'File::Basename' => 0,
     },
     dist                => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
     clean               => { FILES => 'AnyEvent-MultiDownload-*' },
+    META_MERGE => {
+        resources => {
+            repository => 'https://github.com/iakuf/anyevent-multidownload',
+        },
+    },
 );
