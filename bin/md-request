@@ -1,5 +1,7 @@
 #!/usr/bin/perl  
 
+=encoding utf-8
+
 =head1 NAME
 
 md-request - 多线程多地址非阻塞的下载工具
@@ -7,6 +9,20 @@ md-request - 多线程多地址非阻塞的下载工具
 =head1 DESCRIPTION
 
 本工具支持从多个地址下载同一个文件, 并且是单线程事件驱动的分块下载.
+
+=head1 参数
+
+=head2 -a 下载的地址
+
+这个下载的地址可以是多个, 但这多个地址必须是同一个文件. 这样就能从多个地址下载.
+
+=head2 -d 目标地址
+
+如果不写文件存放的地址, 会从 url 传进来的参数中, 取第一个 url 的最后面部分的文件名做为下载后存放的目标文件.
+
+=head2 -n 每个主机的并发数量
+
+这个参数用于指定, 对于下载的地址中, 每个地址开启多少个并发. 这个是以主机名做为标识的.
 
 =head1 EXAMPLE
 
@@ -25,7 +41,6 @@ use AnyEvent;
 use AE;
 use AnyEvent::MultiDownload;
 use Getopt::Long;
-use Smart::Comments;
 
 my $progname = $0;
 $progname =~ s,.*/,,;    # only basename left in progname
@@ -33,12 +48,14 @@ $progname =~ s,.*\\,, if $^O eq "MSWin32";
 $progname =~ s/\.\w*$//; # strip extension if any
 
 #parse option
-my (@urls, $dest);
+my (@urls, $dest, $num_connections);
 
 GetOptions(
     'a=s', \@urls, 
-    '-d', \$dest
+    'd=s', \$dest,
+    'num-connections|n=i', \$num_connections,
 );
+
 unless (@urls) {
     usage();
 }
@@ -56,6 +73,7 @@ my $MultiDown = AnyEvent::MultiDownload->new(
     mirror  => \@urls,
     content_file => $dest || $filename,
     seg_size  => 1 * 1024 * 1024, # 1M
+    max_per_host => $num_connections || 20,
     on_finish => sub {
         my $len = shift;
         my $dur = time - $start_t;
@@ -73,7 +91,7 @@ my $MultiDown = AnyEvent::MultiDownload->new(
 $cv->recv;
 
 sub usage {
-    die "Usage: $progname [-a] <url>\n";
+    die "Usage: $progname [-a] <url> [-n] <10>\n";
 }
 
 sub fbytes {
@@ -88,22 +106,3 @@ sub fbytes {
         return "$n bytes";
     }
 }
-
-#sub fduration {
-#    use integer;
-#    my $secs = int(shift);
-#    my $hours = $secs / (60*60);
-#    $secs -= $hours * 60*60;
-#    my $mins = $secs / 60;
-#    $secs %= 60;
-#    if ($hours) {
-#        return "$hours hours $mins minutes";
-#    }
-#    elsif ($mins >= 2) {
-#        return "$mins minutes";
-#    }
-#    else {
-#        $secs += $mins * 60;
-#        return "$secs seconds";
-#    }
-#}

@@ -12,7 +12,7 @@ use File::Copy;
 use File::Basename;
 use List::Util qw/shuffle/;
 
-our $VERSION = '0.30';
+our $VERSION = '0.40';
 
 has content_file => (
     is => 'ro',
@@ -78,12 +78,17 @@ has seg_size    => is => 'rw', default => sub { 2 * 1024 * 1024 };
 has timeout     => is => 'rw', default => sub { 60 };
 has recurse     => is => 'rw', default => sub { 6 }; 
 has tasks       => is => 'rw', default => sub { [] };
+has max_per_host  => is => 'rw', default => sub { 8 };
 
+sub BUILD {
+    my $self = shift; 
+};
 
 sub get_file_length {
     my $self = shift;
     my $cb   = shift;
     
+
     my ($len, $hdr);
     my $cv = AE::cv {
         $len ? $cb->($len, $hdr) : $self->on_error->("取长度失败");
@@ -176,7 +181,7 @@ sub fetch {
         my $ofs  = $range->{ofs};
         my $tail = $range->{tail};
         my $chunk = $range->{chunk};
-
+        local $AnyEvent::HTTP::MAX_PER_HOST = $self->max_per_host; 
         my $buf;
         my $ev; $ev = http_get $url,
             timeout     => $self->timeout,
@@ -402,9 +407,13 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 
 创建一个多下载的对象.
 
+    my @urls = (
+        'http://mirrors.163.com/ubuntu-releases/12.04/ubuntu-12.04.2-desktop-i386.iso',
+        'http://releases.ubuntu.com/12.04.2/ubuntu-12.04.2-desktop-i386.iso',
+    );
     my $MultiDown = AnyEvent::MultiDownload->new( 
-            url     => 'http://mirrors.163.com/ubuntu-releases/12.04/ubuntu-12.04.2-desktop-i386.iso', 
-            mirror  => ['http://mirrors.163.com/ubuntu-releases/12.04/ubuntu-12.04.2-desktop-i386.iso', 'http://releases.ubuntu.com/12.04.2/ubuntu-12.04.2-desktop-i386.iso'],
+            url     => shift @urls, 
+            mirror  => \@urls, 
             content_file  => $content_file,
             seg_size => 1 * 1024 * 1024, # 1M
             on_seg_finish => sub {
@@ -422,7 +431,7 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
     
     );
 
-=over 11
+=over 8
 
 =item url => 下载的主地址
 
@@ -440,7 +449,6 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 
 默认这个 seg_size 是指每次取块的大小,默认是 1M 一个块, 这个参数会给文件按照 1M 的大小来切成一个个块来下载并合并. 本参数不是必须的.
 
-
 =item retry_interval => 重试的间隔 
 
 重试的间隔, 默认为 3 s.
@@ -449,21 +457,9 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 
 重试每个块所能重试的次数, 默认为 5 次.
 
-=item on_seg_finish => 每块的下载完回调
+=item max_per_host => 每个主机最多的连接数量
 
-当每下载完 1M 时,会回调一次, 你可以用于检查你的下载每块的完整性, 这个时候只有 200 和 206 响应的时候才会回调.
-
-回调传四个参数, 本块下载时响应的 header, 下载的块的实体二进制内容, 下载块的大小, 当前是第几块 检查完后的回调. 这时如果回调为 1 证明检查结果正常, 如果为 0 证明检查失败, 会在次重新下载本块. 
-
-默认模块会帮助检查大小, 所以大小不用对比和检查了, 可以给每块的 MD5 记录下来, 使用这个来对比. 本参数不是必须的. 如果没有这个回调默认检查大小正确.
-
-=item on_finish
-
-当整个文件下载完成时的回调, 下载完成的回调会传一个下载的文件大小的参数过来. 这个回调必须存在.
-
-=item on_error
-
-当整个文件下载过程出错时回调, 这个参数必须存在, 因为不能保证每次下载都能正常.
+目前模块没有开发总连接数控制, 主要原因是.多线路为了快,所以控制单个主机的并发比控制总体好. 默认为 8.
 
 =item timeout
 
@@ -478,6 +474,25 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 =head2 multi_get_file()
 
 事件开始的方法. 只有调用这个函数时, 这个下载的事件才开始执行.
+
+=head1 callback
+
+=head2 on_seg_finish => 每块的下载完回调
+
+当每下载完 1M 时,会回调一次, 你可以用于检查你的下载每块的完整性, 这个时候只有 200 和 206 响应的时候才会回调.
+
+回调传四个参数, 本块下载时响应的 header, 下载的块的实体二进制内容, 下载块的大小, 当前是第几块 检查完后的回调. 这时如果回调为 1 证明检查结果正常, 如果为 0 证明检查失败, 会在次重新下载本块. 
+
+默认模块会帮助检查大小, 所以大小不用对比和检查了, 可以给每块的 MD5 记录下来, 使用这个来对比. 本参数不是必须的. 如果没有这个回调默认检查大小正确.
+
+=head2 on_finish
+
+当整个文件下载完成时的回调, 下载完成的回调会传一个下载的文件大小的参数过来. 这个回调必须存在.
+
+=head2 on_error
+
+当整个文件下载过程出错时回调, 这个参数必须存在, 因为不能保证每次下载都能正常.
+
 
 =head1 AUTHOR
 
