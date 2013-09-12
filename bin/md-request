@@ -24,6 +24,12 @@ md-request - 多线程多地址非阻塞的下载工具
 
 这个参数用于指定, 对于下载的地址中, 每个地址开启多少个并发. 这个是以主机名做为标识的.
 
+=head2 -h 自定义的 header
+
+你想指定自定义的 header 的话, 就指定这个参数, -h 这个参数可以多次指定, 来加入不同的 header . 例如你想指定主机名:
+
+    -h "HOST:www.php-oa.com" -h "User-Agent: Mozilla/5.0 (Windows NT 6.1; WOW64; rv:23.0) Gecko/20100101 Firefox/23.0"
+
 =head1 EXAMPLE
 
 例如, 下载最新的 Perl 的版本:
@@ -48,12 +54,13 @@ $progname =~ s,.*\\,, if $^O eq "MSWin32";
 $progname =~ s/\.\w*$//; # strip extension if any
 
 #parse option
-my (@urls, $dest, $num_connections);
+my (@urls, $dest, $num_connections, @header);
 
 GetOptions(
     'a=s', \@urls, 
     'd=s', \$dest,
     'num-connections|n=i', \$num_connections,
+    'header|h=s', \@header,
 );
 
 unless (@urls) {
@@ -66,11 +73,13 @@ $| = 1;
 
 my ($filename) = $urls[0] =~ /([^\/]+)$/;
 my $start_t = time();
- 
+
+my %headers = map {split '=|:',$_} @header;
 my $cv = AE::cv;
 my $MultiDown = AnyEvent::MultiDownload->new(
     url     => shift @urls,
     mirror  => \@urls,
+    headers => \%headers,
     content_file => $dest || $filename,
     seg_size  => 1 * 1024 * 1024, # 1M
     max_per_host => $num_connections || 20,

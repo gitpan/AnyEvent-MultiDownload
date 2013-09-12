@@ -12,7 +12,7 @@ use File::Copy;
 use File::Basename;
 use List::Util qw/shuffle/;
 
-our $VERSION = '0.40';
+our $VERSION = '0.50';
 
 has content_file => (
     is => 'ro',
@@ -74,9 +74,10 @@ has fh       => (
 
 has retry_interval => is => 'rw', default => sub { 3 };
 has max_retries => is => 'rw', default => sub { 5 };
-has seg_size    => is => 'rw', default => sub { 2 * 1024 * 1024 };
+has seg_size    => is => 'rw', default => sub { 1 * 1024 * 1024 };
 has timeout     => is => 'rw', default => sub { 60 };
 has recurse     => is => 'rw', default => sub { 6 }; 
+has headers      => is => 'rw', default => sub {{}};
 has tasks       => is => 'rw', default => sub { [] };
 has max_per_host  => is => 'rw', default => sub { 8 };
 
@@ -89,21 +90,28 @@ sub get_file_length {
     my $cb   = shift;
     
 
-    my ($len, $hdr);
+    my ($len, $hdr, $body);
     my $cv = AE::cv {
-        $len ? $cb->($len, $hdr) : $self->on_error->("取长度失败");
+        if ( $len ) {
+            $cb->($len, $hdr) 
+        }
+        else{
+            $hdr ? $self->on_error->("连接失败, 响应 $hdr->{Status}, 内容 $body.") 
+                    : $self->on_error->("远程地址没有响应.");
+        }
     };
 
     my $fetch_len; $fetch_len = sub {
         my $retry = shift || 0;
         my $ev; $ev = http_head $self->url,
+            headers => $self->headers, 
             timeout => $self->timeout,
             recurse => $self->recurse,
             sub {
-                (undef, $hdr) = @_;
+                ($body, $hdr) = @_;
                 undef $ev;
                 if ($retry > $self->max_retries) {
-                    $self->on_error->("取长度失败");
+                    $self->on_error->("连接失败, 响应 $hdr->{Status}, 内容 $body.");
                     return;
                 }
                 if ($hdr->{Status} =~ /^2/) {
@@ -189,6 +197,7 @@ sub fetch {
             persistent  => 1,
             keepalive   => 1,
             headers     => { 
+                %{ $self->headers }, 
                 Range => "bytes=$ofs-$tail" 
             },
             on_body => $self->on_body($chunk),
@@ -207,7 +216,7 @@ sub fetch {
                 if ($status == 200 || $status == 206 || $status == 416) {
                     my $size = $self->tasks->[$chunk]{size};
                     if ($size == ($tail-$ofs+1)) {
-                        $self->on_seg_finish->( $hdl, $self->get_chunk($ofs, $self->seg_size), $size, $chunk, sub {
+                        $self->on_seg_finish->( $hdl, $self->get_chunk($ofs, $self->seg_size), $size, $range, sub {
                             my $result = shift;
                             if (!$result) {
                                 $self->retry($cv, $range, $retry);
@@ -447,7 +456,7 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 
 =item seg_size => 下载块的大小
 
-默认这个 seg_size 是指每次取块的大小,默认是 1M 一个块, 这个参数会给文件按照 1M 的大小来切成一个个块来下载并合并. 本参数不是必须的.
+默认这个 seg_size 是指每次取块的大小, 默认是 1M 一个块, 这个参数会给文件按照 1M 的大小来切成一个个块来下载并合并. 本参数不是必须的.
 
 =item retry_interval => 重试的间隔 
 
@@ -460,6 +469,10 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 =item max_per_host => 每个主机最多的连接数量
 
 目前模块没有开发总连接数控制, 主要原因是.多线路为了快,所以控制单个主机的并发比控制总体好. 默认为 8.
+
+=item headers => 自定义的 header
+
+如果你想自己定义传送的 header , 就在这个参数中加就好了, 默认是一个哈希引用.
 
 =item timeout
 
@@ -477,7 +490,7 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 
 =head1 callback
 
-=head2 on_seg_finish => 每块的下载完回调
+=head2 on_seg_finish
 
 当每下载完 1M 时,会回调一次, 你可以用于检查你的下载每块的完整性, 这个时候只有 200 和 206 响应的时候才会回调.
 
