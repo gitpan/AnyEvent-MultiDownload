@@ -12,7 +12,7 @@ use File::Copy;
 use File::Basename;
 use List::Util qw/shuffle/;
 
-our $VERSION = '0.50';
+our $VERSION = '0.60';
 
 has content_file => (
     is => 'ro',
@@ -96,7 +96,7 @@ sub get_file_length {
             $cb->($len, $hdr) 
         }
         else{
-            $hdr ? $self->on_error->("连接失败, 响应 $hdr->{Status}, 内容 $body.") 
+            $hdr ? $self->on_error->("连接失败, 响应 $hdr->{Status}.") 
                     : $self->on_error->("远程地址没有响应.");
         }
     };
@@ -206,7 +206,6 @@ sub fetch {
 
                 my $status = $hdr->{Status};
 
-                $cv->end;
                 undef $ev;
 
                 if ( $retry > $self->max_retries ) {
@@ -222,6 +221,7 @@ sub fetch {
                                 $self->retry($cv, $range, $retry);
                                 return;
                             }
+                            $cv->end;
                             AE::log debug => "地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载完成";
                         });
                         return;
@@ -237,7 +237,6 @@ sub retry {
     my $chunk = $range->{chunk};
     my $w;$w = AE::timer( $self->retry_interval, 0, sub {
         AE::log warn => "地址块 $range->{chunk} 范围 bytes=$range->{ofs}  $range->{tail} 下载失败, 第 $retry 次重试";
-        $cv->begin;
         $self->tasks->[$chunk]->{pos} = $self->tasks->[$chunk]->{ofs}; # 重下本块时要 seek 回零
         $self->fetch->( $cv, $self->shuffle_url, $range, ++$retry );
         undef $w;
