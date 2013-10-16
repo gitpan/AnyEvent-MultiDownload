@@ -1,4 +1,3 @@
-AnyEvent-MultiDownload-0.10.tar.gz
 bin/md-request
 Changes
 lib/AnyEvent/MultiDownload.pm

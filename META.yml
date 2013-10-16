@@ -30,4 +30,4 @@ requires:
   Test::More: 0
 resources:
   repository: https://github.com/iakuf/anyevent-multidownload
-version: 0.70
+version: 0.80

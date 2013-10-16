@@ -13,7 +13,7 @@ use File::Basename;
 use List::Util qw/shuffle/;
 use utf8;
 
-our $VERSION = '0.70';
+our $VERSION = '0.80';
 
 has content_file => (
     is => 'ro',
@@ -73,7 +73,7 @@ has fh       => (
     },
 );
 
-has retry_interval => is => 'rw', default => sub { 3 };
+has retry_interval => is => 'rw', default => sub { 10 };
 has max_retries => is => 'rw', default => sub { 5 };
 has seg_size    => is => 'rw', default => sub { 1 * 1024 * 1024 };
 has timeout     => is => 'rw', default => sub { 60 };
@@ -206,14 +206,12 @@ sub fetch {
             on_body => $self->on_body($chunk),
             sub {
                 my ($hdl, $hdr) = @_;
-
                 my $status = $hdr->{Status};
-
                 undef $ev;
-
                 if ( $retry > $self->max_retries ) {
                     $self->on_error->("地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载失败");
                     $cv->end;
+                    return;
                 }
 
                 if ($status == 200 || $status == 206 || $status == 416) {
@@ -463,7 +461,7 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 
 =item retry_interval => 重试的间隔 
 
-重试的间隔, 默认为 3 s.
+重试的间隔, 默认为 10 s.
 
 =item max_retries => 最多重试的次数
 
