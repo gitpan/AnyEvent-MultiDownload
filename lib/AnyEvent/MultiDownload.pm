@@ -11,8 +11,9 @@ use File::Temp;
 use File::Copy;
 use File::Basename;
 use List::Util qw/shuffle/;
+use utf8;
 
-our $VERSION = '0.60';
+our $VERSION = '0.70';
 
 has content_file => (
     is => 'ro',
@@ -96,7 +97,8 @@ sub get_file_length {
             $cb->($len, $hdr) 
         }
         else{
-            $hdr ? $self->on_error->("连接失败, 响应 $hdr->{Status}.") 
+            my $status = $hdr->{Status};
+            $hdr ? $self->on_error->("连接失败, 响应:". $status ? $status : '无') 
                     : $self->on_error->("远程地址没有响应.");
         }
     };
@@ -112,6 +114,7 @@ sub get_file_length {
                 undef $ev;
                 if ($retry > $self->max_retries) {
                     $self->on_error->("连接失败, 响应 $hdr->{Status}, 内容 $body.");
+                    $cv->end;
                     return;
                 }
                 if ($hdr->{Status} =~ /^2/) {
@@ -210,6 +213,7 @@ sub fetch {
 
                 if ( $retry > $self->max_retries ) {
                     $self->on_error->("地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载失败");
+                    $cv->end;
                 }
 
                 if ($status == 200 || $status == 206 || $status == 416) {
