@@ -11,9 +11,10 @@ use File::Temp;
 use File::Copy;
 use File::Basename;
 use List::Util qw/shuffle/;
+use Smart::Comments;
 use utf8;
 
-our $VERSION = '0.80';
+our $VERSION = '0.90';
 
 has content_file => (
     is => 'ro',
@@ -80,6 +81,7 @@ has timeout     => is => 'rw', default => sub { 60 };
 has recurse     => is => 'rw', default => sub { 6 }; 
 has headers      => is => 'rw', default => sub {{}};
 has tasks       => is => 'rw', default => sub { [] };
+has error       => is => 'rw', default => sub {};
 has max_per_host  => is => 'rw', default => sub { 8 };
 
 sub BUILD {
@@ -93,14 +95,15 @@ sub get_file_length {
 
     my ($len, $hdr, $body);
     my $cv = AE::cv {
-        if ( $len ) {
-            $cb->($len, $hdr) 
+	    if ($len) {
+        	$cb->($len, $hdr); 
+	        return;
+	    }
+	    if ($self->error) {
+	        $self->on_error->($self->error);
+	        return;
         }
-        else{
-            my $status = $hdr->{Status};
-            $hdr ? $self->on_error->("连接失败, 响应:". $status ? $status : '无') 
-                    : $self->on_error->("远程地址没有响应.");
-        }
+	    $self->on_error->("没错误,也没长度");
     };
 
     my $fetch_len; $fetch_len = sub {
@@ -113,12 +116,17 @@ sub get_file_length {
                 ($body, $hdr) = @_;
                 undef $ev;
                 if ($retry > $self->max_retries) {
-                    $self->on_error->("连接失败, 响应 $hdr->{Status}, 内容 $body.");
-                    $cv->end;
-                    return;
+		            my $msg = sprintf("连接失败, 响应 %s, 内容 %s.", 
+			        	$hdr->{Status} ? $hdr->{Status} : '500', 
+			        	$body ? $body : "无"
+		            );
+                    $self->error($msg);
+		            $cv->send;
+		            return;
                 }
                 if ($hdr->{Status} =~ /^2/) {
                     $len = $hdr->{'content-length'};
+                    $cv->end;
                 }
                 else {
                     my $w;$w = AE::timer( $self->retry_interval, 0, sub {
@@ -126,7 +134,6 @@ sub get_file_length {
                         undef $w;
                     });
                 }
-                $cv->end;
             };
     };
     $cv->begin;
@@ -144,8 +151,14 @@ sub multi_get_file  {
         # 用于做事件同步
         my $cv = AE::cv { 
             my $cv = shift;
-            $self->move_to;
-            $self->on_finish->($self->size);
+	        if ($self->error) {
+		        $self->clean;
+	        	$self->on_error->($self->error);
+	        }
+	        else {
+            	$self->move_to;
+            	$self->on_finish->($self->size);
+	        }
         };
 
         # 事件开始, 但这个回调会在最后才调用.
@@ -209,8 +222,8 @@ sub fetch {
                 my $status = $hdr->{Status};
                 undef $ev;
                 if ( $retry > $self->max_retries ) {
-                    $self->on_error->("地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载失败");
-                    $cv->end;
+                    $self->error("地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载失败");
+                    $cv->send;
                     return;
                 }
 
@@ -315,6 +328,14 @@ sub move_to {
     File::Copy::copy( $self->fh->filename, $self->content_file )
           or die "Failed to rename $self->fh->filename to $self->content_file: $!";
 
+    unlink $self->fh->filename;
+    delete $self->{fh};
+}
+
+sub clean {
+    my $self = shift;
+    close $self->fh;
+    unlink $self->fh->filename;
     delete $self->{fh};
 }
 
