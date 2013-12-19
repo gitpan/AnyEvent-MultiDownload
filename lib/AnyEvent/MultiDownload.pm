@@ -11,10 +11,9 @@ use File::Temp;
 use File::Copy;
 use File::Basename;
 use List::Util qw/shuffle/;
-use Smart::Comments;
 use utf8;
 
-our $VERSION = '0.90';
+our $VERSION = '1.02';
 
 has content_file => (
     is => 'ro',
@@ -68,6 +67,7 @@ has fh       => (
     is      => 'rw',
     lazy    => 1,
     default => sub {
+        my $self = shift;
         my $out = File::Temp->new(UNLINK => 1); 
         $out->autoflush(1);
         return $out;
@@ -83,10 +83,22 @@ has headers      => is => 'rw', default => sub {{}};
 has tasks       => is => 'rw', default => sub { [] };
 has error       => is => 'rw', default => sub {};
 has max_per_host  => is => 'rw', default => sub { 8 };
+has _consumables => is => 'rw', default => sub {};
+has url_status  => (
+    is      => 'rw', 
+    lazy    => 1,
+    default => sub { 
+        my $self = shift;
+        my %hash;
+        if ($self->has_mirror) {
+            %hash = map {
+                        $_ => 0
+                    } @{ $self->mirror }, $self->url;
+        }
+        return \%hash;
+    }
+);
 
-sub BUILD {
-    my $self = shift; 
-};
 
 sub get_file_length {
     my $self = shift;
@@ -108,7 +120,7 @@ sub get_file_length {
 
     my $fetch_len; $fetch_len = sub {
         my $retry = shift || 0;
-        my $ev; $ev = http_head $self->url,
+        my $ev; $ev = http_head $self->shuffle_url,
             headers => $self->headers, 
             timeout => $self->timeout,
             recurse => $self->recurse,
@@ -142,11 +154,13 @@ sub get_file_length {
 
 sub multi_get_file  {
     my ($self, $cb)   = @_;
+    local $AnyEvent::HTTP::MAX_PER_HOST = $self->max_per_host; 
 
     $self->get_file_length( sub {
         my ($len, $hdr) = @_;
 
         my $ranges = $self->split_range($len);
+        $self->_consumables($ranges);
 
         # 用于做事件同步
         my $cv = AE::cv { 
@@ -159,24 +173,26 @@ sub multi_get_file  {
             	$self->move_to;
             	$self->on_finish->($self->size);
 	        }
+
+            undef $cv;
         };
 
         # 事件开始, 但这个回调会在最后才调用.
         $cv->begin;
-        for my $range (@$ranges) {
+        for ( 1 .. $self->max_per_host ) {
+            my $req = shift @{ $self->_consumables };
+            last if !$req;
             $cv->begin;
-            $self->fetch->( $cv, $self->shuffle_url, $range, 0 ) ;
+            $self->fetch->( $cv, $self->shuffle_url, $req, 0 ) ;
         }
         $cv->end;
     });
 }
 
-
 sub shuffle_url {
     my $self = shift;
-    my @urls;
-    @urls = @{ $self->mirror } if $self->has_mirror;
-    push @urls, $self->url;
+    my $urls = $self->url_status;
+    my @urls = grep { $urls->{$_} < $self->max_retries } keys %{$urls};
     return (shuffle @urls)[0];
 }
 
@@ -205,7 +221,6 @@ sub fetch {
         my $ofs  = $range->{ofs};
         my $tail = $range->{tail};
         my $chunk = $range->{chunk};
-        local $AnyEvent::HTTP::MAX_PER_HOST = $self->max_per_host; 
         my $buf;
         my $ev; $ev = http_get $url,
             timeout     => $self->timeout,
@@ -222,7 +237,10 @@ sub fetch {
                 my $status = $hdr->{Status};
                 undef $ev;
                 if ( $retry > $self->max_retries ) {
-                    $self->error("地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载失败");
+		            my $msg = sprintf("多次重试失败, 响应: %s 大小: %s", $hdr->{Status} ? $hdr->{Status} : '500', $self->tasks->[$chunk]{size} );
+                    $self->error("地址 $url 的块 $range->{chunk} 出错 $msg");
+                    $self->url_status->{$url}++;
+		            $self->clean;
                     $cv->send;
                     return;
                 }
@@ -231,17 +249,35 @@ sub fetch {
                     my $size = $self->tasks->[$chunk]{size};
                     if ($size == ($tail-$ofs+1)) {
                         $self->on_seg_finish->( $hdl, $self->get_chunk($ofs, $self->seg_size), $size, $range, sub {
-                            my $result = shift;
+                            my ($result, $error) = @_;
                             if (!$result) {
-                                $self->retry($cv, $range, $retry);
+                                $self->error("块较检失败");
+                                $self->url_status->{$url}++;
+		                        $self->clean;
+                                $cv->send;
+                                AE::log debug => "块较检失败";
                                 return;
                             }
-                            $cv->end;
-                            AE::log debug => "地址 $url 的块 $range->{chunk} 范围 bytes=$ofs-$tail 下载完成";
+                            AE::log debug => "地址 $url 的块 $range->{chunk} 下载完成 $$";
+                            my $req = shift @{ $self->_consumables };
+                            if (!$req){
+                                $cv->end;
+                                return; 
+                            }
+                            if (!$self->shuffle_url or $self->error) {
+		                        $self->clean;
+                                $cv->send;
+                            }
+                            else {
+                                $self->fetch->( $cv, $self->shuffle_url, $req, 0 ) ;
+                            }
                         });
                         return;
                     }
                 } 
+		        my $msg = sprintf("连接失败, 响应 %s", $hdr->{Status} ? $hdr->{Status} : '500');
+                AE::log warn => "地址 $url 的块 $range->{chunk} 出错 $msg 第 $retry 次重试";
+                $self->url_status->{$url}++;
                 $self->retry($cv, $range, $retry);
             };
     };
@@ -251,8 +287,12 @@ sub retry {
     my ($self, $cv, $range, $retry) = @_;
     my $chunk = $range->{chunk};
     my $w;$w = AE::timer( $self->retry_interval, 0, sub {
-        AE::log warn => "地址块 $range->{chunk} 范围 bytes=$range->{ofs}  $range->{tail} 下载失败, 第 $retry 次重试";
         $self->tasks->[$chunk]->{pos} = $self->tasks->[$chunk]->{ofs}; # 重下本块时要 seek 回零
+        if (!$self->shuffle_url or $self->error) {
+		    $self->clean;
+            $cv->send;
+            return;
+        }
         $self->fetch->( $cv, $self->shuffle_url, $range, ++$retry );
         undef $w;
     });
@@ -298,6 +338,9 @@ sub split_range {
         $self->tasks->[$chunk] = $task; 
         push @ranges, $task;
         $chunk++;
+    }
+    if (!@ranges) {
+        ### @ranges
     }
     return \@ranges;
 }
@@ -490,7 +533,7 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 
 =item max_per_host => 每个主机最多的连接数量
 
-目前模块没有开发总连接数控制, 主要原因是.多线路为了快,所以控制单个主机的并发比控制总体好. 默认为 8.
+目前模块没有开发总连接数控制, 主要原因是.多线路为了快,所以控制单个主机的并发比控制总体好. 默认为 8. 并且一个 url 最多这么多请求.
 
 =item headers => 自定义的 header
 

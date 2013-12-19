@@ -4,7 +4,7 @@
       "扶凯 <iakuf@163.com>"
    ],
    "dynamic_config" : 1,
-   "generated_by" : "ExtUtils::MakeMaker version 6.62, CPAN::Meta::Converter version 2.112150",
+   "generated_by" : "ExtUtils::MakeMaker version 6.66, CPAN::Meta::Converter version 2.120921",
    "license" : [
       "perl_5"
    ],
@@ -22,26 +22,27 @@
    "prereqs" : {
       "build" : {
          "requires" : {
-            "ExtUtils::MakeMaker" : 0
+            "ExtUtils::MakeMaker" : "0"
          }
       },
       "configure" : {
          "requires" : {
-            "ExtUtils::MakeMaker" : 0
+            "ExtUtils::MakeMaker" : "0"
          }
       },
       "runtime" : {
          "requires" : {
-            "AE" : 0,
-            "AnyEvent::HTTP" : 0,
-            "AnyEvent::Socket" : 0,
-            "AnyEvent::Util" : 0,
-            "File::Basename" : 0,
-            "File::Copy" : 0,
-            "File::Temp" : 0,
-            "List::Util" : 0,
-            "Moo" : 0,
-            "Test::More" : 0
+            "AE" : "0",
+            "AnyEvent::HTTP" : "0",
+            "AnyEvent::Socket" : "0",
+            "AnyEvent::Util" : "0",
+            "EV" : "0",
+            "File::Basename" : "0",
+            "File::Copy" : "0",
+            "File::Temp" : "0",
+            "List::Util" : "0",
+            "Moo" : "0",
+            "Test::More" : "0"
          }
       }
    },
@@ -51,5 +52,5 @@
          "url" : "https://github.com/iakuf/anyevent-multidownload"
       }
    },
-   "version" : "0.90"
+   "version" : "1.02"
 }

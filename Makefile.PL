@@ -13,6 +13,7 @@ WriteMakefile(
     PREREQ_PM => {
         'Test::More' => 0,
         'AE'    => 0,
+        'EV'    => 0,
         'Moo'   => 0,
         'AnyEvent::HTTP'    => 0,
         'AnyEvent::Util'    => 0,
