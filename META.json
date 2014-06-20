@@ -33,7 +33,7 @@
       "runtime" : {
          "requires" : {
             "AE" : "0",
-            "AnyEvent::HTTP" : "0",
+            "AnyEvent::HTTP" : "2.21",
             "AnyEvent::Socket" : "0",
             "AnyEvent::Util" : "0",
             "EV" : "0",
@@ -52,5 +52,5 @@
          "url" : "https://github.com/iakuf/anyevent-multidownload"
       }
    },
-   "version" : "1.02"
+   "version" : "1.04"
 }

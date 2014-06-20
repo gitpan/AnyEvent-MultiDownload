@@ -13,7 +13,7 @@ use File::Basename;
 use List::Util qw/shuffle/;
 use utf8;
 
-our $VERSION = '1.02';
+our $VERSION = '1.04';
 
 has content_file => (
     is => 'ro',
@@ -120,7 +120,8 @@ sub get_file_length {
 
     my $fetch_len; $fetch_len = sub {
         my $retry = shift || 0;
-        my $ev; $ev = http_head $self->shuffle_url,
+        my $url = $self->shuffle_url;
+        my $ev; $ev = http_head $url,
             headers => $self->headers, 
             timeout => $self->timeout,
             recurse => $self->recurse,
@@ -128,7 +129,8 @@ sub get_file_length {
                 ($body, $hdr) = @_;
                 undef $ev;
                 if ($retry > $self->max_retries) {
-		            my $msg = sprintf("连接失败, 响应 %s, 内容 %s.", 
+		            my $msg = sprintf("连接地址 %s 失败, 响应 %s, 内容 %s.", 
+                        $url,
 			        	$hdr->{Status} ? $hdr->{Status} : '500', 
 			        	$body ? $body : "无"
 		            );
@@ -192,8 +194,7 @@ sub multi_get_file  {
 sub shuffle_url {
     my $self = shift;
     my $urls = $self->url_status;
-    my @urls = grep { $urls->{$_} < $self->max_retries } keys %{$urls};
-    return (shuffle @urls)[0];
+    return (shuffle keys %$urls)[0];
 }
 
 sub on_body {
@@ -250,26 +251,26 @@ sub fetch {
                     if ($size == ($tail-$ofs+1)) {
                         $self->on_seg_finish->( $hdl, $self->get_chunk($ofs, $self->seg_size), $size, $range, sub {
                             my ($result, $error) = @_;
+                            # 块较检失败
                             if (!$result) {
                                 $self->error("块较检失败");
                                 $self->url_status->{$url}++;
 		                        $self->clean;
-                                $cv->send;
+                                $cv->send; # 结束本次请求
                                 AE::log debug => "块较检失败";
                                 return;
                             }
-                            AE::log debug => "地址 $url 的块 $range->{chunk} 下载完成 $$";
-                            my $req = shift @{ $self->_consumables };
-                            if (!$req){
-                                $cv->end;
-                                return; 
-                            }
-                            if (!$self->shuffle_url or $self->error) {
-		                        $self->clean;
-                                $cv->send;
-                            }
                             else {
-                                $self->fetch->( $cv, $self->shuffle_url, $req, 0 ) ;
+                                # 块较检成功
+                                AE::log debug => "地址 $url 的块 $range->{chunk} 下载完成 $$";
+                                my $req = shift @{ $self->_consumables };
+                                if ($req and !$self->error){
+                                    $self->fetch->( $cv, $self->shuffle_url, $req, 0 ) ;
+                                }
+                                else {
+                                    $cv->end;  # 结束整个请求
+                                    return; 
+                                }
                             }
                         });
                         return;
@@ -338,9 +339,6 @@ sub split_range {
         $self->tasks->[$chunk] = $task; 
         push @ranges, $task;
         $chunk++;
-    }
-    if (!@ranges) {
-        ### @ranges
     }
     return \@ranges;
 }

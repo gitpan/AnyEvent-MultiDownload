@@ -19,7 +19,7 @@ no_index:
     - inc
 requires:
   AE: 0
-  AnyEvent::HTTP: 0
+  AnyEvent::HTTP: 2.21
   AnyEvent::Socket: 0
   AnyEvent::Util: 0
   EV: 0
@@ -31,4 +31,4 @@ requires:
   Test::More: 0
 resources:
   repository: https://github.com/iakuf/anyevent-multidownload
-version: 1.02
+version: 1.04
