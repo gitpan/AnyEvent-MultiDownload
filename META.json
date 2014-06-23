@@ -4,7 +4,7 @@
       "扶凯 <iakuf@163.com>"
    ],
    "dynamic_config" : 1,
-   "generated_by" : "ExtUtils::MakeMaker version 6.66, CPAN::Meta::Converter version 2.120921",
+   "generated_by" : "ExtUtils::MakeMaker version 6.92, CPAN::Meta::Converter version 2.120921",
    "license" : [
       "perl_5"
    ],
@@ -52,5 +52,5 @@
          "url" : "https://github.com/iakuf/anyevent-multidownload"
       }
    },
-   "version" : "1.04"
+   "version" : "1.06"
 }

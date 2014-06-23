@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 package AnyEvent::MultiDownload;
 use strict;
-use AnyEvent::HTTP;
+use AnyEvent::HTTP qw /http_get/;
 use AnyEvent::Util;
 use AnyEvent::Socket;
 use AnyEvent::IO;
@@ -13,7 +13,7 @@ use File::Basename;
 use List::Util qw/shuffle/;
 use utf8;
 
-our $VERSION = '1.04';
+our $VERSION = '1.06';
 
 has content_file => (
     is => 'ro',
@@ -75,15 +75,15 @@ has fh       => (
 );
 
 has retry_interval => is => 'rw', default => sub { 10 };
-has max_retries => is => 'rw', default => sub { 5 };
-has seg_size    => is => 'rw', default => sub { 1 * 1024 * 1024 };
-has timeout     => is => 'rw', default => sub { 60 };
-has recurse     => is => 'rw', default => sub { 6 }; 
-has headers      => is => 'rw', default => sub {{}};
-has tasks       => is => 'rw', default => sub { [] };
-has error       => is => 'rw', default => sub {};
-has max_per_host  => is => 'rw', default => sub { 8 };
-has _consumables => is => 'rw', default => sub {};
+has max_retries    => is => 'rw', default => sub { 5 };
+has seg_size       => is => 'rw', default => sub { 1 * 1024 * 1024 };
+has timeout        => is => 'rw', default => sub { 60 };
+has recurse        => is => 'rw', default => sub { 6 }; 
+has headers        => is => 'rw', default => sub {{}};
+has tasks          => is => 'rw', default => sub { [] };
+has error          => is => 'rw', default => sub {};
+has task_lists     => is => 'rw', default => sub {[]};
+has max_per_host   => is => 'rw', default => sub { 8 };
 has url_status  => (
     is      => 'rw', 
     lazy    => 1,
@@ -95,100 +95,131 @@ has url_status  => (
                         $_ => 0
                     } @{ $self->mirror }, $self->url;
         }
+        else {
+            $hash{$self->url} = 0;
+        }
         return \%hash;
     }
 );
 
 
-sub get_file_length {
+sub multi_get_file  {
     my $self = shift;
     my $cb   = shift;
     
+    # 用于做事件同步
+    my $cv = AE::cv { 
+        my $cv = shift;
 
-    my ($len, $hdr, $body);
-    my $cv = AE::cv {
-	    if ($len) {
-        	$cb->($len, $hdr); 
-	        return;
+	    if ($cv->recv) {
+            # 有一个不能处理的出错的时候, 发出去的连接都要断开掉, 所以使用这个
+            $self->task_lists(undef);
+	        $self->clean;
+	    	$self->on_error->($self->error);
 	    }
-	    if ($self->error) {
-	        $self->on_error->($self->error);
-	        return;
-        }
-	    $self->on_error->("没错误,也没长度");
+	    else {
+        	$self->move_to;
+        	$self->on_finish->($self->size);
+	    }
+
+        undef $cv;
     };
 
-    my $fetch_len; $fetch_len = sub {
+    my $first_task;
+    my $run; $run = sub {
         my $retry = shift || 0;
         my $url = $self->shuffle_url;
-        my $ev; $ev = http_head $url,
-            headers => $self->headers, 
-            timeout => $self->timeout,
-            recurse => $self->recurse,
+        my $ev; $ev = http_get $url,
+            headers     => $self->headers, 
+            timeout     => $self->timeout,
+            recurse     => $self->recurse,
+            on_header   => sub {
+                my ($hdr) = @_;
+                if ( $hdr->{Status} == 200 ) {
+                    my $len = $hdr->{'content-length'};
+
+                    if (!defined($len)) {
+                        $self->error("Cannot find a content-length header.");
+                    }
+
+                    # 准备开始下载的信息
+                    my $ranges = $self->split_range($len);
+
+                    # 除了第一个块, 其它块现在开始下载
+                    # 事件开始, 但这个回调会在最后才调用.
+                    $first_task = shift @{ $self->tasks };
+                    return 1 if $len <= $self->seg_size;
+
+                    for ( 1 .. $self->max_per_host ) {
+                        my $chunk_task = shift @{ $self->tasks };
+                        last unless defined $chunk_task;
+                        $cv->begin;
+                        $self->fetch_chunk( $cv, $chunk_task) ;
+                    }
+                }
+                1
+            },
+            on_body   => sub {
+                my ($partial_body, $hdr) = @_;
+
+                if ( $hdr->{Status} =~ /^2/ ) {
+
+                    my $len = length($partial_body);
+                    seek($self->fh, $first_task->{pos}, 0); 
+                    syswrite($self->fh, $partial_body) != $len and return 0;
+
+                    # 写完的记录
+                    $first_task->{pos}   += $len;
+                    $first_task->{size}  += $len;
+
+                    if ( ( $hdr->{'content-length'} <= $self->seg_size and  $first_task->{size} == $hdr->{'content-length'} )
+                            or 
+                            $first_task->{size} >= $self->seg_size
+                        ) {
+		                 $cv->end;  # 完成第一个块
+                         undef $ev;
+                         return 0
+                    }
+
+                }
+                return 1;
+            },
             sub {
-                ($body, $hdr) = @_;
+                my (undef, $hdr) = @_;
                 undef $ev;
-                if ($retry > $self->max_retries) {
-		            my $msg = sprintf("连接地址 %s 失败, 响应 %s, 内容 %s.", 
-                        $url,
-			        	$hdr->{Status} ? $hdr->{Status} : '500', 
-			        	$body ? $body : "无"
-		            );
-                    $self->error($msg);
-		            $cv->send;
+                my $status = $hdr->{Status};
+                if ( $retry > $self->max_retries ) {
+		            $self->error( 
+                        sprintf("Status: %s, Reason: %s.", 
+			        	    $status ? $status : '500', 
+                            $hdr->{Reason} ? $hdr->{Reason} : ' ',)
+                    );
+		            $cv->send(1);
 		            return;
                 }
-                if ($hdr->{Status} =~ /^2/) {
-                    $len = $hdr->{'content-length'};
-                    $cv->end;
-                }
-                else {
-                    my $w;$w = AE::timer( $self->retry_interval, 0, sub {
-                        $fetch_len->(++$retry); 
+                return if ( $hdr->{OrigStatus} and $hdr->{OrigStatus} == 200 ) or $hdr->{Status} == 200;
+                if ( $status == 500 or $status == 503 or $status =~ /^59/ ) {
+                    my $w; $w = AE::timer( $self->retry_interval, 0, sub {
+                        $first_task->{pos}  = $first_task->{ofs}; # 重下本块时要 seek 回零
+                        $first_task->{size}  = 0;
+                        $run->(++$retry); 
                         undef $w;
                     });
                 }
-            };
+                else {
+		            $self->error( 
+                        sprintf("Status: %s, Reason: %s.", 
+			        	    $status ? $status : '500', 
+                            $hdr->{Reason} ? $hdr->{Reason} : ' ',)
+                    );
+		            $cv->send(1);
+                    return
+                }
+
+            }
     };
     $cv->begin;
-    $fetch_len->(0);
-}
-
-sub multi_get_file  {
-    my ($self, $cb)   = @_;
-    local $AnyEvent::HTTP::MAX_PER_HOST = $self->max_per_host; 
-
-    $self->get_file_length( sub {
-        my ($len, $hdr) = @_;
-
-        my $ranges = $self->split_range($len);
-        $self->_consumables($ranges);
-
-        # 用于做事件同步
-        my $cv = AE::cv { 
-            my $cv = shift;
-	        if ($self->error) {
-		        $self->clean;
-	        	$self->on_error->($self->error);
-	        }
-	        else {
-            	$self->move_to;
-            	$self->on_finish->($self->size);
-	        }
-
-            undef $cv;
-        };
-
-        # 事件开始, 但这个回调会在最后才调用.
-        $cv->begin;
-        for ( 1 .. $self->max_per_host ) {
-            my $req = shift @{ $self->_consumables };
-            last if !$req;
-            $cv->begin;
-            $self->fetch->( $cv, $self->shuffle_url, $req, 0 ) ;
-        }
-        $cv->end;
-    });
+    $run->(0);
 }
 
 sub shuffle_url {
@@ -198,103 +229,125 @@ sub shuffle_url {
 }
 
 sub on_body {
-    my ($self, $chunk) = @_; 
+    my ($self, $task) = @_; 
     return sub {
         my ($partial_body, $hdr) = @_;
         return 0 unless ($hdr->{Status} == 206 || $hdr->{Status} == 200);
-        my $task_chunk = $self->tasks->[$chunk];
 
-        seek($self->fh, $task_chunk->{pos}, 0); 
+        seek($self->fh, $task->{pos}, 0); 
         syswrite($self->fh, $partial_body);
 
         # 写完的记录
         my $len = length($partial_body);
-        $task_chunk->{pos}   += $len;
-        $task_chunk->{size}  += $len;
+        $task->{pos}   += $len;
+        $task->{size}  += $len;
         return 1;
     }
 }
-sub fetch {
-    my $self = shift;
-    return sub {
-        my ($cv, $url, $range, $retry) = @_; 
-        $retry ||= 0;
-        my $ofs  = $range->{ofs};
-        my $tail = $range->{tail};
-        my $chunk = $range->{chunk};
-        my $buf;
-        my $ev; $ev = http_get $url,
-            timeout     => $self->timeout,
-            recurse     => $self->recurse,
-            persistent  => 1,
-            keepalive   => 1,
-            headers     => { 
-                %{ $self->headers }, 
-                Range => "bytes=$ofs-$tail" 
-            },
-            on_body => $self->on_body($chunk),
-            sub {
-                my ($hdl, $hdr) = @_;
-                my $status = $hdr->{Status};
-                undef $ev;
-                if ( $retry > $self->max_retries ) {
-		            my $msg = sprintf("多次重试失败, 响应: %s 大小: %s", $hdr->{Status} ? $hdr->{Status} : '500', $self->tasks->[$chunk]{size} );
-                    $self->error("地址 $url 的块 $range->{chunk} 出错 $msg");
-                    $self->url_status->{$url}++;
-		            $self->clean;
-                    $cv->send;
-                    return;
-                }
+sub fetch_chunk {
+    my ($self, $cv, $task, $retry) = @_; 
+    $retry ||= 0;
+    my $url   = $self->shuffle_url;
 
-                if ($status == 200 || $status == 206 || $status == 416) {
-                    my $size = $self->tasks->[$chunk]{size};
-                    if ($size == ($tail-$ofs+1)) {
-                        $self->on_seg_finish->( $hdl, $self->get_chunk($ofs, $self->seg_size), $size, $range, sub {
-                            my ($result, $error) = @_;
-                            # 块较检失败
-                            if (!$result) {
-                                $self->error("块较检失败");
-                                $self->url_status->{$url}++;
-		                        $self->clean;
-                                $cv->send; # 结束本次请求
-                                AE::log debug => "块较检失败";
-                                return;
+    my $ev; $ev = http_get $url,
+        timeout     => $self->timeout,
+        recurse     => $self->recurse,
+        persistent  => 1,
+        keepalive   => 1,
+        headers     => { 
+            %{ $self->headers }, 
+            Range => $task->{range} 
+        },
+        on_body => $self->on_body($task),
+        sub {
+            my ($hdl, $hdr) = @_;
+            my $status = $hdr->{Status};
+            undef $ev;
+            if ( $retry > $self->max_retries ) {
+	            $self->error( 
+                    sprintf("Too many failures, Status: %s, Reason: %s.", 
+		        	    $status ? $status : '500', 
+                        $hdr->{Reason} ? $hdr->{Reason} : ' ',)
+                ) if !$self->error;
+                $self->url_status->{$url}++;
+	            $self->clean;
+                $cv->send(1);
+                return;
+            }
+
+            # 成功
+            # 1. 需要对比大小是否一致, 接着对比块较检
+            # 2. 开始下一个任务的下载
+            # 3. 当前块就退出, 不然下面会重试
+            if ( $status == 200 || $status == 206  ) {
+                if ($task->{size} == ( $task->{tail} -$task->{ofs} + 1 ) ) {
+                    # 三种情况
+                    # 1. 大小不相等 | 进入下面的重试看是否有可能成功
+                    # 2. 大小相等, 块较检不相等 | 直接失败
+                    # 3. 大小相等, 块较检相等
+                    $self->on_seg_finish->( $hdl, $self->get_chunk( $task->{ofs}, $self->seg_size ), $task->{size}, $task->{chunk}, sub {
+                        my ($result, $error) = @_;
+                        # 2. 大小相等, 块较检不相等 | 直接失败
+                        if (!$result) {
+                            $self->error("The $task->{chunk} block the compared failure");
+                            $self->url_status->{$url}++;
+	                        $self->clean;
+                            $cv->send(1); # 失败, 结束整个请求
+                            AE::log debug => $self->error;
+                            return;
+                        }
+                        else {
+                            # 情况 3, 大小相等, 块较检相等, 当前块下载完成, 开始下载新的 
+                            AE::log debug => "地址 $url 的块 $task->{chunk} 下载完成 $$";
+                            my $chunk_task = shift @{ $self->tasks };
+                            # 处理接下来的一个请求
+                            if ( $chunk_task ) {
+                                $self->fetch_chunk($cv, $chunk_task);
                             }
                             else {
-                                # 块较检成功
-                                AE::log debug => "地址 $url 的块 $range->{chunk} 下载完成 $$";
-                                my $req = shift @{ $self->_consumables };
-                                if ($req and !$self->error){
-                                    $self->fetch->( $cv, $self->shuffle_url, $req, 0 ) ;
-                                }
-                                else {
-                                    $cv->end;  # 结束整个请求
-                                    return; 
-                                }
+                                $cv->end;  # 完成, 标记结束本次请求
+                                return; 
                             }
-                        });
-                        return;
-                    }
-                } 
-		        my $msg = sprintf("连接失败, 响应 %s", $hdr->{Status} ? $hdr->{Status} : '500');
-                AE::log warn => "地址 $url 的块 $range->{chunk} 出错 $msg 第 $retry 次重试";
-                $self->url_status->{$url}++;
-                $self->retry($cv, $range, $retry);
-            };
-    };
+                        }
+                    });
+                    return;
+                }
+            } 
+
+	        $self->error( 
+                sprintf("Chunk %s the size is wrong, expect the size: %s actual size: %s, The %s try again,  Status: %s, Reason: %s.", 
+                    $task->{chunk},
+                    $self->seg_size,
+                    $task->{size},
+                    $retry,
+		    	    $status ? $status : '500', 
+                    $hdr->{Reason} ? $hdr->{Reason} : ' ', )
+            );
+            AE::log warn => $self->error;
+            $self->url_status->{$url}++;
+            
+            # 失败
+            # 1. 如果有可能还连接上的响应, 就需要重试, 直到达到重试
+            # 2. 如果不可能连接的响应, 就直接快速的退出
+            if ( $status =~ /^(59.|503|500|502|200|206|)$/ ) {
+                $self->retry($cv, $task, $retry);
+            }
+            else {
+                # 直接失败
+		        $self->clean;
+                $cv->send(1);
+                return;
+            }
+        };
+    $self->task_lists->[$task->{chunk}] = $ev;
 }
 
 sub retry {
-    my ($self, $cv, $range, $retry) = @_;
-    my $chunk = $range->{chunk};
+    my ($self, $cv, $task, $retry) = @_;
     my $w;$w = AE::timer( $self->retry_interval, 0, sub {
-        $self->tasks->[$chunk]->{pos} = $self->tasks->[$chunk]->{ofs}; # 重下本块时要 seek 回零
-        if (!$self->shuffle_url or $self->error) {
-		    $self->clean;
-            $cv->send;
-            return;
-        }
-        $self->fetch->( $cv, $self->shuffle_url, $range, ++$retry );
+        $task->{pos}  = $task->{ofs}; # 重下本块时要 seek 回零
+        $task->{size} = 0;
+        $self->fetch_chunk( $cv, $task, ++$retry );
         undef $w;
     });
 }
@@ -327,20 +380,18 @@ sub split_range {
             $tail = $length-1;
         }
 
-        my $Range = "bytes=$ofs-" . $tail ;
         my $task  = { 
-            ofs   => $ofs,
-            tail  => $tail,
-            chunk => $chunk,
-            pos   => $ofs,
-            size  => 0,
+            chunk => $chunk, # 当前块编号
+            ofs   => $ofs,   # 当前的偏移量
+            pos   => $ofs,   # 本块的起点
+            tail  => $tail,  # 本块的结束
+            range => 'bytes=' . $ofs . '-' . $tail, 
+            size  => 0,      # 总共下载的长度
         }; 
 
         $self->tasks->[$chunk] = $task; 
-        push @ranges, $task;
         $chunk++;
     }
-    return \@ranges;
 }
 
 sub get_chunk {
