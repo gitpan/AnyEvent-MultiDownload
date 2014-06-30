@@ -11,9 +11,11 @@ use File::Temp;
 use File::Copy;
 use File::Basename;
 use List::Util qw/shuffle/;
+use AnyEvent::Digest;
 use utf8;
 
-our $VERSION = '1.06';
+our $VERSION = '1.07';
+
 
 has content_file => (
     is => 'ro',
@@ -34,6 +36,13 @@ has mirror => (
     isa => sub {
         return 1 if ref $_[0] eq 'ARRAY';
     },
+);
+
+has digest => (
+    is => 'rw',
+    isa => sub {
+        return 1 if $_[0] =~ /Digest::(SHA|MD5)/;
+    }
 );
 
 
@@ -148,6 +157,8 @@ sub multi_get_file  {
                     # 除了第一个块, 其它块现在开始下载
                     # 事件开始, 但这个回调会在最后才调用.
                     $first_task = shift @{ $self->tasks };
+                    $first_task->{chunk} = $first_task->{chunk} || 0;
+                    $first_task->{ofs}   = $first_task->{ofs}   || 0;
                     return 1 if $len <= $self->seg_size;
 
                     for ( 1 .. $self->max_per_host ) {
@@ -161,26 +172,33 @@ sub multi_get_file  {
             },
             on_body   => sub {
                 my ($partial_body, $hdr) = @_;
-
-                if ( $hdr->{Status} =~ /^2/ ) {
-
-                    my $len = length($partial_body);
-                    seek($self->fh, $first_task->{pos}, 0); 
-                    syswrite($self->fh, $partial_body) != $len and return 0;
-
-                    # 写完的记录
-                    $first_task->{pos}   += $len;
-                    $first_task->{size}  += $len;
-
+                if ( $self->on_body($first_task)->($partial_body, $hdr) ) {
+                    # 如果是第一个块的话, 下载到指定的大小就需要断开
                     if ( ( $hdr->{'content-length'} <= $self->seg_size and  $first_task->{size} == $hdr->{'content-length'} )
                             or 
                             $first_task->{size} >= $self->seg_size
                         ) {
-		                 $cv->end;  # 完成第一个块
-                         undef $ev;
-                         return 0
-                    }
+                        $self->on_seg_finish->( 
+                             $hdr,
+                             $first_task, 
+                             $self->digest ? $first_task->{ctx}->hexdigest : '', 
+                        sub {
 
+                            my ($result, $error) = @_;
+                            # 2. 大小相等, 块较检不相等 | 直接失败
+                            if ($result) {
+		                        $cv->end;  # 完成第一个块
+                            }
+                            else {
+                                $self->error("The 0 block the compared failure");
+                                $self->url_status->{$url}++;
+                                $cv->send(1); # 失败, 结束整个请求
+                                AE::log debug => $self->error;
+                                return;
+                            }
+                        });
+                        return 0
+                    }
                 }
                 return 1;
             },
@@ -201,7 +219,8 @@ sub multi_get_file  {
                 if ( $status == 500 or $status == 503 or $status =~ /^59/ ) {
                     my $w; $w = AE::timer( $self->retry_interval, 0, sub {
                         $first_task->{pos}  = $first_task->{ofs}; # 重下本块时要 seek 回零
-                        $first_task->{size}  = 0;
+                        $first_task->{size} = 0;
+                        $first_task->{ctx}  = undef;
                         $run->(++$retry); 
                         undef $w;
                     });
@@ -234,11 +253,22 @@ sub on_body {
         my ($partial_body, $hdr) = @_;
         return 0 unless ($hdr->{Status} == 206 || $hdr->{Status} == 200);
 
+        my $len = length($partial_body);
+        # 主要是用于解决第一个块会超过写的位置
+        if ( $task->{size} + $len > $self->seg_size ) {
+            my $spsize = $len - ( $task->{size} + $len - $self->seg_size );
+            $partial_body = substr($partial_body, 0, $spsize);
+            $len = $spsize; 
+        }
+
         seek($self->fh, $task->{pos}, 0); 
-        syswrite($self->fh, $partial_body);
+        syswrite($self->fh, $partial_body) != $len and return 0;
 
         # 写完的记录
-        my $len = length($partial_body);
+        if ( $self->digest ) {
+            $task->{ctx} ||= AnyEvent::Digest->new($self->digest);
+            $task->{ctx}->add_async($partial_body);
+        }
         $task->{pos}   += $len;
         $task->{size}  += $len;
         return 1;
@@ -270,7 +300,6 @@ sub fetch_chunk {
                         $hdr->{Reason} ? $hdr->{Reason} : ' ',)
                 ) if !$self->error;
                 $self->url_status->{$url}++;
-	            $self->clean;
                 $cv->send(1);
                 return;
             }
@@ -285,31 +314,35 @@ sub fetch_chunk {
                     # 1. 大小不相等 | 进入下面的重试看是否有可能成功
                     # 2. 大小相等, 块较检不相等 | 直接失败
                     # 3. 大小相等, 块较检相等
-                    $self->on_seg_finish->( $hdl, $self->get_chunk( $task->{ofs}, $self->seg_size ), $task->{size}, $task->{chunk}, sub {
-                        my ($result, $error) = @_;
-                        # 2. 大小相等, 块较检不相等 | 直接失败
-                        if (!$result) {
-                            $self->error("The $task->{chunk} block the compared failure");
-                            $self->url_status->{$url}++;
-	                        $self->clean;
-                            $cv->send(1); # 失败, 结束整个请求
-                            AE::log debug => $self->error;
-                            return;
-                        }
-                        else {
-                            # 情况 3, 大小相等, 块较检相等, 当前块下载完成, 开始下载新的 
-                            AE::log debug => "地址 $url 的块 $task->{chunk} 下载完成 $$";
-                            my $chunk_task = shift @{ $self->tasks };
-                            # 处理接下来的一个请求
-                            if ( $chunk_task ) {
-                                $self->fetch_chunk($cv, $chunk_task);
+                    $self->on_seg_finish->( 
+                            $hdl, 
+                            $task, 
+                            $self->digest ? $task->{ctx}->hexdigest : '', 
+                        sub {
+                            my ($result, $error) = @_;
+                            # 2. 大小相等, 块较检不相等 | 直接失败
+                            if (!$result) {
+                                $self->error("The $task->{chunk} block the compared failure");
+                                $self->url_status->{$url}++;
+                                $cv->send(1); # 失败, 结束整个请求
+                                AE::log debug => $self->error;
+                                return;
                             }
                             else {
-                                $cv->end;  # 完成, 标记结束本次请求
-                                return; 
+                                # 情况 3, 大小相等, 块较检相等, 当前块下载完成, 开始下载新的 
+                                AE::log debug => "地址 $url 的块 $task->{chunk} 下载完成 $$";
+                                my $chunk_task = shift @{ $self->tasks };
+                                # 处理接下来的一个请求
+                                if ( $chunk_task ) {
+                                    $self->fetch_chunk($cv, $chunk_task);
+                                }
+                                else {
+                                    $cv->end;  # 完成, 标记结束本次请求
+                                    return; 
+                                }
                             }
                         }
-                    });
+                    );
                     return;
                 }
             } 
@@ -334,7 +367,6 @@ sub fetch_chunk {
             }
             else {
                 # 直接失败
-		        $self->clean;
                 $cv->send(1);
                 return;
             }
@@ -347,6 +379,7 @@ sub retry {
     my $w;$w = AE::timer( $self->retry_interval, 0, sub {
         $task->{pos}  = $task->{ofs}; # 重下本块时要 seek 回零
         $task->{size} = 0;
+        $task->{ctx}  = undef;
         $self->fetch_chunk( $cv, $task, ++$retry );
         undef $w;
     });
@@ -392,19 +425,6 @@ sub split_range {
         $self->tasks->[$chunk] = $task; 
         $chunk++;
     }
-}
-
-sub get_chunk {
-  my ($self, $offset, $max) = @_; 
-  $max ||= 1024 * 1024;
-
-  my $handle = $self->fh;
-  $handle->sysseek($offset, SEEK_SET);
-
-  my $buffer;
-  $handle->sysread($buffer, $max); 
-
-  return $buffer;
 }
 
 sub move_to {
@@ -469,7 +489,7 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
         content_file  => '/tmp/ubuntu.iso',
         seg_size => 1 * 1024 * 1024, # 1M
         on_seg_finish => sub {
-            my ($hdr, $seg, $size, $chunk, $cb) = @_;
+            my ($hdr, $chunk_obj, $md5, $cb) = @_;
             $cb->(1);
         },
         on_finish => sub {
@@ -540,7 +560,7 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
             content_file  => $content_file,
             seg_size => 1 * 1024 * 1024, # 1M
             on_seg_finish => sub {
-                my ($hdr, $seg_path, $size, $chunk,  $cb) = @_;
+                my ($hdr, $chunk_obj, $md5, $cb) = @_;
                 $cb->(1);
             },
             on_finish => sub {
@@ -571,6 +591,10 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 =item seg_size => 下载块的大小
 
 默认这个 seg_size 是指每次取块的大小, 默认是 1M 一个块, 这个参数会给文件按照 1M 的大小来切成一个个块来下载并合并. 本参数不是必须的.
+
+=item digest
+
+用于指定所使用的块较检所使用的模块, 支持 Digest::MD5 和 Digest::SHA1
 
 =item retry_interval => 重试的间隔 
 
@@ -608,9 +632,9 @@ AnyEvent::MultiDownload - 非阻塞的多线程多地址文件下载的模块
 
 当每下载完 1M 时,会回调一次, 你可以用于检查你的下载每块的完整性, 这个时候只有 200 和 206 响应的时候才会回调.
 
-回调传四个参数, 本块下载时响应的 header, 下载的块的实体二进制内容, 下载块的大小, 当前是第几块 检查完后的回调. 这时如果回调为 1 证明检查结果正常, 如果为 0 证明检查失败, 会在次重新下载本块. 
+回调传四个参数, 本块下载时响应的 header, 当前块的信息的引用 ( 包含 chunk 第几块, size 下载块的大小, pos 块的开始位置 ), 检查的 md5 的结果, 最后一个参数为处理完后的回调. 这时如果回调为 1 证明检查结果正常, 如果为 0 证明检查失败, 会在次重新下载本块. 
 
-默认模块会帮助检查大小, 所以大小不用对比和检查了, 可以给每块的 MD5 记录下来, 使用这个来对比. 本参数不是必须的. 如果没有这个回调默认检查大小正确.
+默认模块会帮助检查大小, 所以大小不用对比和检查了, 这个地方会根据 $self->digest 指定的信息, 给每块的 MD5 或者 SHA1 记录下来, 使用这个来对比. 本参数不是必须的. 如果没有这个回调默认检查大小正确.
 
 =head2 on_finish
 

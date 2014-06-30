@@ -18,6 +18,7 @@ WriteMakefile(
         'AnyEvent::HTTP'    => 2.21,
         'AnyEvent::Util'    => 0,
         'AnyEvent::Socket'  => 0,
+        'AnyEvent::Digest'  => 0.0.5,
         'List::Util'        => 0,
         'File::Temp' => 0,
         'File::Copy' => 0,

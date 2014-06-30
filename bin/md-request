@@ -85,7 +85,7 @@ my $MultiDown = AnyEvent::MultiDownload->new(
     max_per_host => $num_connections || 20,
     on_finish => sub {
         my $len = shift;
-        my $dur = time - $start_t;
+        my $dur = time - $start_t || 1;
         my $speed = fbytes($len/$dur) . "/sec";
         print STDERR "Finished. " . fbytes($len) . " received in $dur seconds ($speed)\n";
         $cv->send;
