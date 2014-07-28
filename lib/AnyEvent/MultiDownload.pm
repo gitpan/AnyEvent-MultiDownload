@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 package AnyEvent::MultiDownload;
 use strict;
-use AnyEvent::HTTP qw /http_get/;
+use AnyEvent::HTTP qw/http_get/;
 use AnyEvent::Util;
 use AnyEvent::Socket;
 use AnyEvent::IO;
@@ -14,7 +14,7 @@ use List::Util qw/shuffle/;
 use AnyEvent::Digest;
 use utf8;
 
-our $VERSION = '1.07';
+our $VERSION = '1.08';
 
 
 has content_file => (
